@@ -520,6 +520,117 @@ cv_summary
 ```
 
 ```{r}
+# ------------------------------
+# Single-Seed Normal Split for Comparison
+# ------------------------------
+
+set.seed(555)  # different seed from CV
+n <- nrow(X_all)
+train_idx_single <- sample(seq_len(n), size = floor(0.8 * n))  # 80-20 split
+test_idx_single  <- setdiff(seq_len(n), train_idx_single)
+
+Xtr_single <- X_all[train_idx_single, , drop = FALSE]
+Xte_single <- X_all[test_idx_single, , drop = FALSE]
+ytr_single <- factor(droplevels(y_all[train_idx_single]), levels = c("Tumor", "Normal"))
+yte_single <- factor(droplevels(y_all[test_idx_single]), levels = c("Tumor", "Normal"))
+
+# Precomputed PKPB meta-features
+Etr_single <- E_all_df[train_idx_single, ]
+Ete_single <- E_all_df[test_idx_single, ]
+
+# PLS top features from meta-features (same as in CV)
+pls_model_single <- plsr(as.numeric(ytr_single) - 1 ~ ., data = Etr_single[, -1, drop = FALSE], ncomp = 5, validation = "CV")
+pls_loadings_single <- abs(loadings(pls_model_single))
+pls_top_features_single <- colnames(Etr_single)[-1][order(rowSums(pls_loadings_single), decreasing = TRUE)[1:min(5, ncol(Etr_single)-1)]]
+
+# Feature sets
+feature_sets_single <- list(
+  Entropy = list(train = Etr_single, test = Ete_single, selected = selected),
+  PLS = list(
+    train = data.frame(Etr_single[, pls_top_features_single, drop = FALSE], Class = ytr_single),
+    test  = data.frame(Ete_single[, pls_top_features_single, drop = FALSE], Class = yte_single),
+    selected = pls_top_features_single
+  )
+)
+
+# Inner CV control (same as CV)
+inner_trctrl_single <- make_inner_trctrl(seed = 555)
+
+# Storage for probabilities and best HMMs
+probs_list_single <- list()
+best_hmms_single <- list()
+
+for (fs_name in names(feature_sets_single)) {
+  fs <- feature_sets_single[[fs_name]]
+  selected_features <- fs$selected %||% colnames(fs$train)[colnames(fs$train) != "Class"]
+
+  X_train <- as.matrix(fs$train[, selected_features, drop = FALSE])
+  X_test  <- as.matrix(fs$test[, selected_features, drop = FALSE])
+  y_train <- fs$train$Class
+
+  # Train caret models
+  models_single <- list()
+  models_single$logistic <- fit_glmnet(X_train, y_train, inner_trctrl_single)
+  models_single$rf <- caret::train(x = X_train, y = y_train, method = "rf", metric = "ROC", trControl = inner_trctrl_single, tuneLength = 5, ntree = 500)
+  models_single$knn <- caret::train(x = X_train, y = y_train, method = "knn", metric = "ROC", trControl = inner_trctrl_single, tuneLength = 5)
+  models_single$svm <- caret::train(x = X_train, y = y_train, method = "svmRadial", metric = "ROC", trControl = inner_trctrl_single, tuneLength = 5)
+  models_single$xgb <- caret::train(x = X_train, y = y_train, method = "xgbTree", metric = "ROC", trControl = inner_trctrl_single, tuneLength = 5,
+                                    tuneGrid = expand.grid(nrounds = 100, max_depth = 3, eta = 0.1,
+                                                           gamma = 0, colsample_bytree = 0.8,
+                                                           min_child_weight = 1, subsample = 0.8))
+  models_single$bayesglm <- caret::train(x = X_train, y = y_train, method = "bayesglm", metric = "ROC", trControl = inner_trctrl_single)
+
+  # Predict caret models
+  for (nm in names(models_single)) {
+    probs_list_single[[paste(fs_name, nm, sep = "_")]] <- get_prob(models_single[[nm]], as.data.frame(X_test))
+  }
+
+  # HMM
+  n_tumor <- sum(y_train == "Tumor")
+  n_normal <- sum(y_train == "Normal")
+  prior_ratio <- log(n_tumor / n_normal)
+
+  hmm_res_single <- tune_hmm(train_df = fs$train, test_df = fs$test, selected_features = selected_features,
+                             prior_ratio = prior_ratio, states_list = 3:4, bins_list = 3:5)
+
+  probs_list_single[[paste(fs_name, "HMM", sep = "_")]] <- hmm_res_single$probs
+  best_hmms_single[[fs_name]] <- list(tumor = hmm_res_single$tumor, normal = hmm_res_single$normal)
+}
+
+# Evaluate metrics
+models_metrics_single <- tibble()
+for (mname in names(probs_list_single)) {
+  pr <- probs_list_single[[mname]]
+  if (all(is.na(pr))) {
+    row <- tibble(model = mname, AUC = NA_real_, Accuracy = NA_real_, Sensitivity = NA_real_,
+                  Specificity = NA_real_, F1 = NA_real_, FN = NA_real_)
+  } else {
+    pred_class <- factor(ifelse(pr >= 0.5, "Tumor", "Normal"), levels = levels(yte_single))
+    auc_val <- tryCatch(as.numeric(pROC::roc(response = yte_single, predictor = pr, quiet = TRUE)$auc),
+                        error = function(e) NA_real_)
+    cm <- tryCatch(confusionMatrix(pred_class, yte_single, positive = "Tumor"), error = function(e) NULL)
+    if (is.null(cm)) {
+      row <- tibble(model = mname, AUC = auc_val, Accuracy = NA_real_, Sensitivity = NA_real_,
+                    Specificity = NA_real_, F1 = NA_real_, FN = NA_real_)
+    } else {
+      row <- tibble(model = mname, Accuracy = cm$overall["Accuracy"], AUC = auc_val,
+                    Sensitivity = cm$byClass["Sensitivity"], Specificity = cm$byClass["Specificity"],
+                    F1 = cm$byClass["F1"], FN = cm$table["Normal", "Tumor"])
+    }
+  }
+  models_metrics_single <- bind_rows(models_metrics_single, row)
+}
+
+# Aggregate results with same ranking as CV
+cv_summary_single <- models_metrics_single %>%
+  arrange(desc(Accuracy), desc(Sensitivity), desc(AUC))
+
+# Print
+print(cv_summary_single)
+
+```
+
+```{r}
 library(ggplot2)
 library(reshape2)
 library(cowplot)
@@ -683,3 +794,4 @@ ggplot(cv_long, aes(x = model_clean, y = Value, fill = selection)) +
 
 
 ```
+
